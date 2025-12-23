@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+
+# OS
+.DS_Store
+
+# Large Data & Models (>100MB)
+models/yolov8x.pt
+models/yolov8x-obb.pt
+real_cars.tif
+
+# Output files
+*_result.*
+*_vis.png
+*.xlsx
+*.kml
+*.json
