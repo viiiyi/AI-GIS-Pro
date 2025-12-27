@@ -6,19 +6,24 @@ import numpy as np
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import box, Polygon, LineString
+import json
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QMessageBox, QTextEdit, 
                              QHBoxLayout, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
                              QComboBox, QGraphicsRectItem, QGraphicsPolygonItem, QToolBar,
                              QStyle, QTableWidget, QTableWidgetItem, QHeaderView, QSplitter, QFrame,
                              QProgressBar, QGroupBox, QRadioButton, QButtonGroup, QListWidget,
-                             QLineEdit, QStackedWidget, QSlider, QCheckBox, QMenu, QGraphicsLineItem, QGraphicsEllipseItem)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QRectF, QPointF, QSize, QEvent
+                             QLineEdit, QStackedWidget, QSlider, QCheckBox, QMenu, QGraphicsLineItem, QGraphicsEllipseItem,
+                             QTabWidget, QToolBox, QMenuBar, QDockWidget, QGraphicsItemGroup, QGraphicsTextItem)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QRectF, QPointF, QSize, QEvent, QSettings
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QWheelEvent, QPolygonF, QAction, QIcon, QFont, QBrush, QCursor
 from ultralytics import YOLO
 import cv2
 import torch
 from torchvision.ops import nms
+import webbrowser
+from PyQt6.QtCore import QDate
+from PyQt6.QtWidgets import QDateEdit, QDialog, QFormLayout, QDoubleSpinBox, QSpinBox
 
 # Matplotlib integration
 import matplotlib
@@ -50,6 +55,7 @@ class MplCanvas(FigureCanvas):
 class ZoomableGraphicsView(QGraphicsView):
     # 定义点击信号，传递场景坐标
     clicked_signal = pyqtSignal(QPointF)
+    mouse_moved_signal = pyqtSignal(QPointF)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -61,6 +67,7 @@ class ZoomableGraphicsView(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setBackgroundBrush(QColor(40, 44, 52)) # 现代深色背景
         self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setMouseTracking(True) # 开启鼠标追踪
         self.measure_mode = None # 'distance', 'area', None
 
     def wheelEvent(self, event: QWheelEvent):
@@ -69,6 +76,11 @@ class ZoomableGraphicsView(QGraphicsView):
         factor = 1.001 ** delta
         self.scale(factor, factor)
         
+    def mouseMoveEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        self.mouse_moved_signal.emit(scene_pos)
+        super().mouseMoveEvent(event)
+
     def mousePressEvent(self, event):
         if self.measure_mode and event.button() == Qt.MouseButton.LeftButton:
             # 将视图坐标转换为场景坐标
@@ -95,11 +107,13 @@ class DetectionThread(QThread):
     result_signal = pyqtSignal(str, str, str, list) # original_path, vis_path, stats, detections
     progress_signal = pyqtSignal(int, str, str) # percent, eta, usage
 
-    def __init__(self, model_path, image_paths, output_dir):
+    def __init__(self, model_path, image_paths, output_dir, conf=0.25, iou=0.45):
         super().__init__()
         self.model_path = model_path
         self.image_paths = image_paths
         self.output_dir = output_dir
+        self.conf = conf
+        self.iou = iou
 
     def run(self):
         try:
@@ -158,7 +172,7 @@ class DetectionThread(QThread):
                                 crop = img_array[y:y+h_slice, x:x+w_slice]
                                 
                                 # 预测
-                                results = model.predict(crop, save=False, conf=0.2, augment=False, verbose=False, device=device)
+                                results = model.predict(crop, save=False, conf=self.conf, iou=self.iou, augment=False, verbose=False, device=device)
                                 
                                 for r in results:
                                     # 处理 OBB (旋转框)
@@ -214,7 +228,7 @@ class DetectionThread(QThread):
                             
                     else:
                         self.log_signal.emit("影像较小，使用全图模式...")
-                        results = model.predict(img_array, save=False, conf=0.2, augment=False, device=device)
+                        results = model.predict(img_array, save=False, conf=self.conf, iou=self.iou, augment=False, device=device)
                         result = results[0]
                         
                         if result.obb is not None and len(result.obb) > 0:
@@ -311,12 +325,19 @@ class DetectionThread(QThread):
             print(error_msg) 
             self.finish_signal.emit(f"❌ 出错: {str(e)}")
 
+# --- GEE 下载对话框 ---
+
+
 # --- 界面部分 ---
 class AI_GIS_App(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI GIS 遥感智能解译系统 (Pro)")
         self.setGeometry(100, 100, 1400, 900)
+        
+        # 持久化设置
+        self.settings = QSettings("AI_GIS_Lab", "AI_GIS_Pro")
+        
         self.img_paths = [] 
         self.results = {} 
         
@@ -329,6 +350,18 @@ class AI_GIS_App(QMainWindow):
         self.is_heatmap = False
         self.min_conf = 0.2
         
+        # 图层管理
+        self.layer_groups = {
+            'image': None,
+            'vector': None,
+            'label': None
+        }
+        self.layer_visibility = {
+            'image': True,
+            'vector': True,
+            'label': True
+        }
+        
         # 测量相关
         self.measure_points = []
         self.measure_items = []
@@ -336,6 +369,10 @@ class AI_GIS_App(QMainWindow):
         
         self.apply_stylesheet()
         self.init_ui()
+        self.create_menus()
+        self.create_dock_windows()
+        self.init_status_bar()
+        self.load_settings()
 
     def apply_stylesheet(self):
         self.setStyleSheet("""
@@ -368,8 +405,17 @@ class AI_GIS_App(QMainWindow):
                 border: 1px solid #3e4451; border-radius: 4px; margin-top: 10px; padding-top: 10px; font-weight: bold; color: #61afef; 
             }
             QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; }
+            QToolBox::tab {
+                background: #21252b;
+                color: #abb2bf;
+                border-radius: 4px;
+                border: 1px solid #3e4451;
+            }
+            QToolBox::tab:selected {
+                font-weight: bold;
+                color: #61afef;
+            }
         """)
-
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -380,76 +426,119 @@ class AI_GIS_App(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        # --- 左侧控制栏 ---
+        # --- 左侧控制栏 (使用 QToolBox 优化布局) ---
         left_panel = QWidget()
         left_panel.setMinimumWidth(400)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(20, 20, 20, 20)
-        left_layout.setSpacing(15)
+        left_layout.setContentsMargins(10, 10, 10, 10)
         
         title_lbl = QLabel("<h2>🛰️ AI 遥感检测 Pro</h2>")
-        title_lbl.setStyleSheet("color: #61afef;")
+        title_lbl.setStyleSheet("color: #61afef; margin-bottom: 10px;")
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_layout.addWidget(title_lbl)
         
-        # 1. 模型选择
-        model_group = QGroupBox("🧠 模型配置")
-        model_layout = QVBoxLayout(model_group)
+        self.toolbox = QToolBox()
+        left_layout.addWidget(self.toolbox)
+        
+        # Page 1: 模型与配置
+        page_config = QWidget()
+        config_layout = QVBoxLayout(page_config)
+        
+        # 模型选择
+        config_layout.addWidget(QLabel("选择检测模型:"))
         self.combo_model = QComboBox()
         self.combo_model.addItem("YOLOv8n-OBB (遥感/DOTA) - 旋转框", os.path.join("models", "yolov8n-obb.pt"))
         self.combo_model.addItem("YOLOv8x-OBB (遥感/DOTA) - 高精旋转", os.path.join("models", "yolov8x-obb.pt"))
         self.combo_model.addItem("YOLOv8n (通用/COCO) - 速度快", os.path.join("models", "yolov8n.pt"))
         self.combo_model.addItem("YOLOv8x (通用/COCO) - 精度高", os.path.join("models", "yolov8x.pt"))
         self.combo_model.currentIndexChanged.connect(self.on_model_changed)
-        model_layout.addWidget(self.combo_model)
+        config_layout.addWidget(self.combo_model)
         
         self.lbl_model_desc = QLabel("适合航拍视角，支持旋转目标检测 (如船只、车辆)")
         self.lbl_model_desc.setWordWrap(True)
-        self.lbl_model_desc.setStyleSheet("font-size: 12px; color: #98c379;")
-        model_layout.addWidget(self.lbl_model_desc)
-        left_layout.addWidget(model_group)
-
-        # 2. 文件与运行
-        file_group = QGroupBox("📂 任务队列")
-        file_layout = QVBoxLayout(file_group)
+        self.lbl_model_desc.setStyleSheet("font-size: 12px; color: #98c379; margin-bottom: 10px;")
+        config_layout.addWidget(self.lbl_model_desc)
         
-        file_btn_layout = QHBoxLayout()
-        self.btn_img = QPushButton("➕ 添加影像")
+        # 推理参数
+        param_group = QGroupBox("推理参数微调")
+        param_layout = QVBoxLayout(param_group)
+        
+        # IOU
+        iou_layout = QHBoxLayout()
+        iou_layout.addWidget(QLabel("NMS IOU:"))
+        self.spin_iou = QSlider(Qt.Orientation.Horizontal)
+        self.spin_iou.setRange(1, 100)
+        self.spin_iou.setValue(45)
+        iou_layout.addWidget(self.spin_iou)
+        self.lbl_iou_val = QLabel("0.45")
+        self.spin_iou.valueChanged.connect(lambda v: self.lbl_iou_val.setText(f"{v/100:.2f}"))
+        iou_layout.addWidget(self.lbl_iou_val)
+        param_layout.addLayout(iou_layout)
+        
+        # Conf
+        conf_layout = QHBoxLayout()
+        conf_layout.addWidget(QLabel("Min Conf:"))
+        self.spin_conf_infer = QSlider(Qt.Orientation.Horizontal)
+        self.spin_conf_infer.setRange(1, 100)
+        self.spin_conf_infer.setValue(25)
+        conf_layout.addWidget(self.spin_conf_infer)
+        self.lbl_conf_infer_val = QLabel("0.25")
+        self.spin_conf_infer.valueChanged.connect(lambda v: self.lbl_conf_infer_val.setText(f"{v/100:.2f}"))
+        conf_layout.addWidget(self.lbl_conf_infer_val)
+        param_layout.addLayout(conf_layout)
+        
+        config_layout.addWidget(param_group)
+        config_layout.addStretch()
+        
+        self.toolbox.addItem(page_config, "🛠️ 模型与配置")
+        
+        # Page 2: 任务队列
+        page_task = QWidget()
+        task_layout = QVBoxLayout(page_task)
+        
+        btn_layout = QHBoxLayout()
+        self.btn_img = QPushButton("➕ 影像")
         self.btn_img.clicked.connect(self.select_image)
-        file_btn_layout.addWidget(self.btn_img)
+        btn_layout.addWidget(self.btn_img)
         
-        self.btn_clear = QPushButton("🗑️ 清空")
+        self.btn_folder = QPushButton("📂 文件夹")
+        self.btn_folder.clicked.connect(self.select_folder)
+        btn_layout.addWidget(self.btn_folder)
+        
+        self.btn_clear = QPushButton("🗑️")
+        self.btn_clear.setFixedWidth(40)
         self.btn_clear.clicked.connect(self.clear_queue)
-        file_btn_layout.addWidget(self.btn_clear)
-        file_layout.addLayout(file_btn_layout)
-
+        btn_layout.addWidget(self.btn_clear)
+        
+        task_layout.addLayout(btn_layout)
+        
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.file_list.itemClicked.connect(self.on_file_clicked)
-        file_layout.addWidget(self.file_list)
-
-        # 输出目录选择
-        out_dir_layout = QHBoxLayout()
-        self.line_output = QLineEdit()
-        self.line_output.setPlaceholderText("选择结果保存目录...")
-        self.line_output.setReadOnly(True)
-        out_dir_layout.addWidget(self.line_output)
+        task_layout.addWidget(self.file_list)
         
+        # Output
+        out_layout = QHBoxLayout()
+        self.line_output = QLineEdit()
+        self.line_output.setPlaceholderText("结果保存目录...")
+        self.line_output.setReadOnly(True)
+        out_layout.addWidget(self.line_output)
         self.btn_browse = QPushButton("📂")
         self.btn_browse.setFixedWidth(40)
         self.btn_browse.clicked.connect(self.select_output_dir)
-        out_dir_layout.addWidget(self.btn_browse)
-        file_layout.addLayout(out_dir_layout)
-
+        out_layout.addWidget(self.btn_browse)
+        task_layout.addLayout(out_layout)
+        
         self.btn_run = QPushButton("🚀 批量开始智能解译")
         self.btn_run.clicked.connect(self.start_process)
         self.btn_run.setEnabled(False)
         self.btn_run.setStyleSheet("background-color: #98c379; color: #282c34; font-size: 16px; padding: 12px;")
-        file_layout.addWidget(self.btn_run)
+        task_layout.addWidget(self.btn_run)
         
-        # 进度条
+        # Progress
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
-        file_layout.addWidget(self.progress_bar)
+        task_layout.addWidget(self.progress_bar)
         
         status_layout = QHBoxLayout()
         self.lbl_eta = QLabel("ETA: --:--")
@@ -457,29 +546,27 @@ class AI_GIS_App(QMainWindow):
         status_layout.addWidget(self.lbl_eta)
         status_layout.addStretch()
         status_layout.addWidget(self.lbl_usage)
-        file_layout.addLayout(status_layout)
+        task_layout.addLayout(status_layout)
         
-        left_layout.addWidget(file_group)
-
-        # 3. 结果可视化
-        res_group = QGroupBox("📊 结果分析")
-        res_layout = QVBoxLayout(res_group)
+        self.toolbox.addItem(page_task, "📂 任务队列")
+        self.toolbox.setCurrentIndex(1) # Default to task page
         
-        # 导出按钮
+        # Page 3: 结果与日志
+        page_res = QWidget()
+        res_layout = QVBoxLayout(page_res)
+        
         self.btn_export = QPushButton("💾 导出结果 (Excel/GeoJSON/KML)")
         self.btn_export.clicked.connect(self.export_results)
         self.btn_export.setEnabled(False)
         self.btn_export.setStyleSheet("background-color: #d19a66; color: #282c34; font-weight: bold;")
         res_layout.addWidget(self.btn_export)
         
-        # 日志 (隐藏在底部或作为弹出)
-        self.log_box = QTextEdit()
-        self.log_box.setMaximumHeight(200) # 增加高度，因为图表移走了
-        self.log_box.setReadOnly(True)
         res_layout.addWidget(QLabel("运行日志:"))
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
         res_layout.addWidget(self.log_box)
         
-        left_layout.addWidget(res_group)
+        self.toolbox.addItem(page_res, "📊 结果与日志")
         
         splitter.addWidget(left_panel)
 
@@ -554,6 +641,7 @@ class AI_GIS_App(QMainWindow):
         self.add_toolbar_action(toolbar, "🔍 放大", self.action_zoom_in)
         self.add_toolbar_action(toolbar, "🔍 缩小", self.action_zoom_out)
         self.add_toolbar_action(toolbar, "🖼️ 适应窗口", self.action_fit_view)
+        self.add_toolbar_action(toolbar, "📷 截图", self.action_screenshot)
         toolbar.addSeparator()
         self.add_toolbar_action(toolbar, "✋ 拖拽模式", self.action_pan_mode)
         
@@ -574,6 +662,7 @@ class AI_GIS_App(QMainWindow):
         self.scene = QGraphicsScene()
         self.view = ZoomableGraphicsView(self.scene)
         self.view.clicked_signal.connect(self.on_view_clicked) # 连接点击信号
+        self.view.mouse_moved_signal.connect(self.on_mouse_moved)
         page_img_layout.addWidget(self.view)
         
         # 底部导航栏
@@ -649,6 +738,181 @@ class AI_GIS_App(QMainWindow):
         splitter.addWidget(right_panel)
         splitter.setSizes([450, 950])
 
+    def create_menus(self):
+        menubar = self.menuBar()
+        menubar.setStyleSheet("background-color: #21252b; color: #abb2bf;")
+        
+        # File Menu
+        file_menu = menubar.addMenu("文件 (File)")
+        
+        action_open_img = QAction("打开影像", self)
+        action_open_img.triggered.connect(self.select_image)
+        file_menu.addAction(action_open_img)
+        
+        action_open_folder = QAction("打开文件夹", self)
+        action_open_folder.triggered.connect(self.select_folder)
+        file_menu.addAction(action_open_folder)
+        
+        file_menu.addSeparator()
+        
+        action_save_proj = QAction("保存项目 (Save Project)", self)
+        action_save_proj.setShortcut("Ctrl+S")
+        action_save_proj.triggered.connect(self.save_project)
+        file_menu.addAction(action_save_proj)
+        
+        action_load_proj = QAction("加载项目 (Load Project)", self)
+        action_load_proj.setShortcut("Ctrl+O")
+        action_load_proj.triggered.connect(self.load_project)
+        file_menu.addAction(action_load_proj)
+        
+        file_menu.addSeparator()
+        
+        action_exit = QAction("退出", self)
+        action_exit.triggered.connect(self.close)
+        file_menu.addAction(action_exit)
+        
+        # View Menu
+        view_menu = menubar.addMenu("视图 (View)")
+        self.action_toggle_layer = QAction("图层管理器", self)
+        self.action_toggle_layer.setCheckable(True)
+        self.action_toggle_layer.setChecked(True)
+        self.action_toggle_layer.triggered.connect(lambda: self.dock_layer.setVisible(self.action_toggle_layer.isChecked()))
+        view_menu.addAction(self.action_toggle_layer)
+
+    def create_dock_windows(self):
+        # Layer Manager Dock
+        self.dock_layer = QDockWidget("图层管理 (Layers)", self)
+        self.dock_layer.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        
+        layer_widget = QWidget()
+        layer_layout = QVBoxLayout(layer_widget)
+        
+        self.chk_layer_img = QCheckBox("显示原始影像")
+        self.chk_layer_img.setChecked(True)
+        self.chk_layer_img.stateChanged.connect(lambda s: self.toggle_layer('image', s))
+        layer_layout.addWidget(self.chk_layer_img)
+        
+        self.chk_layer_vec = QCheckBox("显示检测框")
+        self.chk_layer_vec.setChecked(True)
+        self.chk_layer_vec.stateChanged.connect(lambda s: self.toggle_layer('vector', s))
+        layer_layout.addWidget(self.chk_layer_vec)
+        
+        self.chk_layer_lbl = QCheckBox("显示标签文字")
+        self.chk_layer_lbl.setChecked(True)
+        self.chk_layer_lbl.stateChanged.connect(lambda s: self.toggle_layer('label', s))
+        layer_layout.addWidget(self.chk_layer_lbl)
+        
+        layer_layout.addStretch()
+        self.dock_layer.setWidget(layer_widget)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock_layer)
+
+    def init_status_bar(self):
+        self.status_bar = self.statusBar()
+        self.status_bar.setStyleSheet("background-color: #21252b; color: #abb2bf;")
+        
+        self.lbl_coords = QLabel("Ready")
+        self.lbl_coords.setStyleSheet("padding: 0 10px;")
+        self.status_bar.addPermanentWidget(self.lbl_coords)
+
+    def load_settings(self):
+        # Restore geometry
+        geometry = self.settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+            
+        # Restore last output dir
+        last_output = self.settings.value("last_output_dir")
+        if last_output:
+            self.line_output.setText(last_output)
+            
+        # Restore model selection
+        last_model_idx = self.settings.value("last_model_index", type=int)
+        if last_model_idx is not None:
+            self.combo_model.setCurrentIndex(last_model_idx)
+
+    def save_settings(self):
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("last_output_dir", self.line_output.text())
+        self.settings.setValue("last_model_index", self.combo_model.currentIndex())
+
+    def closeEvent(self, event):
+        self.save_settings()
+        super().closeEvent(event)
+
+    def save_project(self):
+        path, _ = QFileDialog.getSaveFileName(self, "保存项目", "project.json", "JSON Files (*.json)")
+        if not path: return
+        
+        data = {
+            "img_paths": self.img_paths,
+            "results": self.results, # Note: results might contain non-serializable data if not careful, but currently dicts/lists
+            "output_dir": self.line_output.text()
+        }
+        
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.status_bar.showMessage(f"项目已保存: {path}", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+
+    def load_project(self):
+        path, _ = QFileDialog.getOpenFileName(self, "加载项目", "", "JSON Files (*.json)")
+        if not path: return
+        
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            self.img_paths = data.get("img_paths", [])
+            self.results = data.get("results", {})
+            output_dir = data.get("output_dir", "")
+            
+            # Restore UI
+            self.file_list.clear()
+            for p in self.img_paths:
+                base_name = os.path.basename(p)
+                item = QListWidget(self.file_list).item(0) # Dummy
+                self.file_list.addItem(base_name)
+                # Find the item we just added
+                item = self.file_list.item(self.file_list.count() - 1)
+                
+                # Check if processed
+                if p in self.results:
+                    item.setForeground(QColor("#98c379"))
+                    item.setText(f"✅ {base_name}")
+                
+                item.setData(Qt.ItemDataRole.UserRole, p)
+                
+            self.line_output.setText(output_dir)
+            if self.img_paths and output_dir:
+                self.btn_run.setEnabled(True)
+                self.btn_export.setEnabled(bool(self.results))
+                
+            self.status_bar.showMessage(f"项目已加载: {path}", 3000)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"加载失败: {str(e)}")
+
+    def toggle_layer(self, layer_name, state):
+        is_visible = (state == Qt.CheckState.Checked.value)
+        self.layer_visibility[layer_name] = is_visible
+        
+        group = self.layer_groups.get(layer_name)
+        if group:
+            group.setVisible(is_visible)
+
+    def on_mouse_moved(self, pos):
+        px_x, px_y = pos.x(), pos.y()
+        text = f"Pixel: ({int(px_x)}, {int(px_y)})"
+        
+        if self.current_transform:
+            # Pixel to Geo
+            gx, gy = rasterio.transform.xy(self.current_transform, px_y, px_x, offset='center')
+            text += f" | Geo: ({gx:.6f}, {gy:.6f})"
+            
+        self.lbl_coords.setText(text)
+
     def switch_right_view(self, index):
         self.stack_right.setCurrentIndex(index)
         if index == 0:
@@ -686,6 +950,27 @@ class AI_GIS_App(QMainWindow):
         
     def action_fit_view(self):
         self.view.reset_zoom()
+        
+    def action_screenshot(self):
+        # 截图当前视图
+        if not self.scene.items():
+            return
+            
+        # 弹出保存对话框
+        path, _ = QFileDialog.getSaveFileName(self, "保存截图", "screenshot.png", "Images (*.png *.jpg)")
+        if path:
+            # 获取场景的边界矩形
+            rect = self.scene.itemsBoundingRect()
+            # 创建图像
+            image = QImage(rect.size().toSize(), QImage.Format.Format_ARGB32)
+            image.fill(Qt.GlobalColor.transparent)
+            
+            painter = QPainter(image)
+            self.scene.render(painter, target=QRectF(image.rect()), source=rect)
+            painter.end()
+            
+            image.save(path)
+            self.log_box.append(f"截图已保存: {path}")
         
     def action_pan_mode(self):
         self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
@@ -860,6 +1145,14 @@ class AI_GIS_App(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
 
+    def add_image_to_list(self, path):
+        if path not in self.img_paths:
+            self.img_paths.append(path)
+            self.file_list.addItem(os.path.basename(path))
+            if self.line_output.text():
+                self.btn_run.setEnabled(True)
+            self.btn_clear.setEnabled(True)
+
     def select_image(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择影像 (支持多选)", "", "GeoTIFF (*.tif *.tiff)")
         if paths:
@@ -873,6 +1166,29 @@ class AI_GIS_App(QMainWindow):
                 if self.line_output.text():
                     self.btn_run.setEnabled(True)
                 self.btn_clear.setEnabled(True)
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择包含影像的文件夹")
+        if folder:
+            # 递归查找 .tif, .tiff, .jpg, .png
+            valid_exts = ('.tif', '.tiff', '.jpg', '.png', '.jpeg')
+            count = 0
+            for root, dirs, files in os.walk(folder):
+                for file in files:
+                    if file.lower().endswith(valid_exts):
+                        path = os.path.join(root, file)
+                        if path not in self.img_paths:
+                            self.img_paths.append(path)
+                            self.file_list.addItem(os.path.basename(path))
+                            count += 1
+            
+            if count > 0:
+                self.log_box.append(f"已添加文件夹中的 {count} 张影像。")
+                if self.line_output.text():
+                    self.btn_run.setEnabled(True)
+                self.btn_clear.setEnabled(True)
+            else:
+                QMessageBox.information(self, "提示", "该文件夹下未找到支持的影像文件。")
 
     def clear_queue(self):
         self.img_paths = []
@@ -904,7 +1220,11 @@ class AI_GIS_App(QMainWindow):
         # 获取选中的模型路径
         model_path = self.combo_model.currentData()
         
-        self.worker = DetectionThread(model_path, self.img_paths, output_dir)
+        # 获取参数
+        conf = self.spin_conf_infer.value() / 100.0
+        iou = self.spin_iou.value() / 100.0
+        
+        self.worker = DetectionThread(model_path, self.img_paths, output_dir, conf=conf, iou=iou)
         self.worker.log_signal.connect(self.log_box.append)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.result_signal.connect(self.show_result)
@@ -976,6 +1296,10 @@ class AI_GIS_App(QMainWindow):
         # vis_path = res['vis_path'] # 不再使用预渲染的图片
         detections_list = res['detections']
         
+        # 显示统计信息到日志
+        if 'stats' in res:
+            self.log_box.append(res['stats'])
+        
         self.all_detections = detections_list
         
         # 加载原始图片用于动态绘制
@@ -991,17 +1315,33 @@ class AI_GIS_App(QMainWindow):
                     img_data = src.read()
                     # (bands, h, w) -> (h, w, bands)
                     img_array = np.transpose(img_data, (1, 2, 0))
+                    
+                    # Handle dimensions
+                    if len(img_array.shape) == 2:
+                        img_array = np.expand_dims(img_array, axis=2)
+
                     # 只取前3个波段
                     if img_array.shape[2] >= 3:
                         img_array = img_array[:, :, :3]
+                    
                     # 转换为 uint8
                     if img_array.dtype != np.uint8:
                         # 简单的归一化
-                        img_array = ((img_array - img_array.min()) / (img_array.max() - img_array.min()) * 255).astype(np.uint8)
+                        min_val = np.nanmin(img_array)
+                        max_val = np.nanmax(img_array)
+                        if max_val > min_val:
+                            img_array = ((img_array - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+                        else:
+                            img_array = np.zeros_like(img_array, dtype=np.uint8)
                     
-                    self.current_cv_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-            except:
-                self.current_cv_img = None
+                    if img_array.shape[2] == 1:
+                        self.current_cv_img = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+                    else:
+                        self.current_cv_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            except Exception as e:
+                print(f"Rasterio load failed: {e}")
+                # Fallback to cv2
+                self.current_cv_img = cv2.imread(img_path)
             
             # 更新类别下拉框
             unique_classes = sorted(list(set([d['name'] for d in detections_list])))
@@ -1043,6 +1383,11 @@ class AI_GIS_App(QMainWindow):
         self.scene.clear()
         self.highlight_item = None
         
+        # Create Groups
+        self.layer_groups['image'] = QGraphicsItemGroup()
+        self.layer_groups['vector'] = QGraphicsItemGroup()
+        self.layer_groups['label'] = QGraphicsItemGroup()
+        
         # 3. 绘制
         h, w = self.current_cv_img.shape[:2]
         
@@ -1076,33 +1421,68 @@ class AI_GIS_App(QMainWindow):
             h, w, ch = overlay.shape
             bytes_per_line = ch * w
             qimg = QImage(overlay.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            self.scene.addPixmap(QPixmap.fromImage(qimg))
+            
+            pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(qimg))
+            self.layer_groups['image'].addToGroup(pixmap_item)
             
         else:
-            # 绘制原始图片 + 矢量框
-            # 转为 QPixmap
+            # Image Layer
             rgb_img = cv2.cvtColor(self.current_cv_img, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_img.shape
             bytes_per_line = ch * w
             qimg = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            self.scene.addPixmap(QPixmap.fromImage(qimg))
+            pixmap_item = QGraphicsPixmapItem(QPixmap.fromImage(qimg))
+            self.layer_groups['image'].addToGroup(pixmap_item)
             
-            # 绘制框
+            # Vector & Label Layers
             pen = QPen(QColor(255, 0, 0)) # 红色
             pen.setWidth(2)
             
             for d in filtered:
+                label_x, label_y = 0, 0
+                
                 if 'polygon' in d:
                     points = d['polygon']
                     qpoints = [QPointF(p[0], p[1]) for p in points]
                     poly_item = QGraphicsPolygonItem(QPolygonF(qpoints))
                     poly_item.setPen(pen)
-                    self.scene.addItem(poly_item)
+                    self.layer_groups['vector'].addToGroup(poly_item)
+                    label_x, label_y = points[0][0], points[0][1]
                 else:
                     bbox = d['bbox']
                     rect_item = QGraphicsRectItem(bbox[0], bbox[1], bbox[2]-bbox[0], bbox[3]-bbox[1])
                     rect_item.setPen(pen)
-                    self.scene.addItem(rect_item)
+                    self.layer_groups['vector'].addToGroup(rect_item)
+                    label_x, label_y = bbox[0], bbox[1]
+
+                # 绘制标签 (背景 + 文字)
+                label_str = f"{d['name']} {d['score']:.2f}"
+                
+                text_item = QGraphicsTextItem(label_str)
+                text_item.setDefaultTextColor(QColor("white"))
+                text_item.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+                
+                br = text_item.boundingRect()
+                # 调整标签位置到框的上方
+                bg_rect = QGraphicsRectItem(label_x, label_y - br.height(), br.width(), br.height())
+                bg_rect.setBrush(QBrush(QColor(255, 0, 0)))
+                bg_rect.setPen(QPen(Qt.PenStyle.NoPen))
+                
+                self.layer_groups['label'].addToGroup(bg_rect)
+                
+                text_item.setPos(label_x, label_y - br.height())
+                text_item.setZValue(1) # 确保文字在背景之上
+                self.layer_groups['label'].addToGroup(text_item)
+
+        # Add groups to scene
+        self.scene.addItem(self.layer_groups['image'])
+        self.scene.addItem(self.layer_groups['vector'])
+        self.scene.addItem(self.layer_groups['label'])
+        
+        # Apply visibility
+        self.layer_groups['image'].setVisible(self.layer_visibility['image'])
+        self.layer_groups['vector'].setVisible(self.layer_visibility['vector'])
+        self.layer_groups['label'].setVisible(self.layer_visibility['label'])
 
         self.view.reset_zoom()
 
