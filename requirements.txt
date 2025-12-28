@@ -11,3 +11,4 @@ shapely>=2.0.0
 matplotlib>=3.7.0
 psutil>=5.9.0
 earthengine-api>=0.1.300
+pyogrio>=0.7.0

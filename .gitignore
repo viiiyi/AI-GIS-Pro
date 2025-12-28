@@ -20,3 +20,9 @@ real_cars.tif
 *.kml
 *.json
 AI_GIS_Project_Submission.zip
+
+# PyInstaller Build Artifacts
+build/
+dist/
+*.log
+

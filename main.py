@@ -39,6 +39,16 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 # --- Matplotlib Widget ---
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
@@ -447,10 +457,10 @@ class AI_GIS_App(QMainWindow):
         # 模型选择
         config_layout.addWidget(QLabel("选择检测模型:"))
         self.combo_model = QComboBox()
-        self.combo_model.addItem("YOLOv8n-OBB (遥感/DOTA) - 旋转框", os.path.join("models", "yolov8n-obb.pt"))
-        self.combo_model.addItem("YOLOv8x-OBB (遥感/DOTA) - 高精旋转", os.path.join("models", "yolov8x-obb.pt"))
-        self.combo_model.addItem("YOLOv8n (通用/COCO) - 速度快", os.path.join("models", "yolov8n.pt"))
-        self.combo_model.addItem("YOLOv8x (通用/COCO) - 精度高", os.path.join("models", "yolov8x.pt"))
+        self.combo_model.addItem("YOLOv8n-OBB (遥感/DOTA) - 旋转框", resource_path(os.path.join("models", "yolov8n-obb.pt")))
+        self.combo_model.addItem("YOLOv8x-OBB (遥感/DOTA) - 高精旋转", resource_path(os.path.join("models", "yolov8x-obb.pt")))
+        self.combo_model.addItem("YOLOv8n (通用/COCO) - 速度快", resource_path(os.path.join("models", "yolov8n.pt")))
+        self.combo_model.addItem("YOLOv8x (通用/COCO) - 精度高", resource_path(os.path.join("models", "yolov8x.pt")))
         self.combo_model.currentIndexChanged.connect(self.on_model_changed)
         config_layout.addWidget(self.combo_model)
         

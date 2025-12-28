@@ -35,12 +35,23 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## � Windows 打包与分发
+
+本项目提供了完整的 Windows 可执行程序打包方案。
+
+- **快速开始**: 请阅读 [docs/windows_packaging/START_HERE.md](docs/windows_packaging/START_HERE.md)
+- **一键构建**: 双击运行 `build_windows.bat`
+- **详细指南**: 参见 [docs/windows_packaging/BUILD_WINDOWS.md](docs/windows_packaging/BUILD_WINDOWS.md)
+
 ## 📂 目录结构
 ```
 AI_GIS_Project/
 ├── main.py              # 主程序入口
 ├── models/              # 模型权重文件
 ├── scripts/             # 辅助脚本
+├── docs/                # 项目文档
+│   └── windows_packaging/ # Windows 打包相关文档
+├── build_windows.bat    # Windows 构建脚本
 ├── .gitignore           # Git 忽略配置
 └── README.md            # 项目说明
 ```
