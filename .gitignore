@@ -2,27 +2,84 @@
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
-.env
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# OS
+# Virtual Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyInstaller
+*.manifest
+*.spec
+
+# VS Code
+.vscode/
+
+# Mac OS
 .DS_Store
 
-# Large Data & Models (>100MB)
+# Project specific
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.geojson
+*.kml
+output/
+results/
+temp/
+!sample.tif
+
+# Large Models (Optional: uncomment if you don't want to upload large models)
 models/yolov8x.pt
 models/yolov8x-obb.pt
-real_cars.tif
 
-# Output files
-*_result.*
-*_vis.png
-*.xlsx
-*.kml
-*.json
-AI_GIS_Project_Submission.zip
-
-# PyInstaller Build Artifacts
-build/
-dist/
-*.log
 

@@ -141,6 +141,13 @@ class DetectionThread(QThread):
             self.log_signal.emit(f"正在加载模型: {os.path.basename(self.model_path)}...")
             model = YOLO(self.model_path)
             
+            if not os.path.exists(self.output_dir):
+                try:
+                    os.makedirs(self.output_dir, exist_ok=True)
+                except Exception as e:
+                    self.log_signal.emit(f"⚠️ 无法创建输出目录: {e}")
+                    return
+
             total_files = len(self.image_paths)
             
             for idx, image_path in enumerate(self.image_paths):
@@ -1642,12 +1649,12 @@ class AI_GIS_App(QMainWindow):
         QMessageBox.information(self, "状态", msg)
 
 if __name__ == '__main__':
-    try:
-        import PyQt6
-        plugin_path = os.path.join(os.path.dirname(PyQt6.__file__), 'Qt6', 'plugins')
-        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = plugin_path
-    except:
-        pass
+    # try:
+    #     import PyQt6
+    #     plugin_path = os.path.join(os.path.dirname(PyQt6.__file__), 'Qt6', 'plugins')
+    #     os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = plugin_path
+    # except:
+    #     pass
 
     app = QApplication(sys.argv)
     window = AI_GIS_App()
