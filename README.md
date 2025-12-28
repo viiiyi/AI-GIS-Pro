@@ -46,7 +46,7 @@ AI_GIS_Project/
 ```
 
 ## 📝 注意事项
-- 大模型文件 (`yolov8x.pt`, `yolov8x-obb.pt`) 和大型测试影像 (`real_cars.tif`) 因文件过大未包含在仓库中，请自行下载或训练后放入 `models/` 目录。
+- 大模型文件 (`yolov8x.pt`, `yolov8x-obb.pt`) 请自行下载或训练后放入 `models/` 目录。
 
 ## 📄 License
 MIT
