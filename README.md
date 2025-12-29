@@ -55,5 +55,22 @@ AI_GIS_Project/
 ## 📝 注意事项
 - 大模型文件 (`yolov8x.pt`, `yolov8x-obb.pt`) 请自行下载或训练后放入 `models/` 目录。
 
+## � Reference
+This project uses [YOLOv8](https://github.com/ultralytics/ultralytics) by Ultralytics.
+
+```bibtex
+@software{Jocher_YOLO_by_Ultralytics_2023,
+  author = {Jocher, Glenn and Chaurasia, Ayush and Qiu, Jing},
+  license = {AGPL-3.0},
+  month = jan,
+  title = {{YOLO by Ultralytics}},
+  url = {https://github.com/ultralytics/ultralytics},
+  version = {8.0.0},
+  year = {2023}
+}
+```
+
 ## 📄 License
-MIT
+This project is licensed under the MIT License.
+
+**Note**: The YOLOv8 models and `ultralytics` library used in this project are licensed under **AGPL-3.0**. Please ensure you comply with their license requirements when using this software.
