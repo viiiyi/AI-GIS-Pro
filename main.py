@@ -1,6 +1,14 @@
 import sys
 import os
 import time
+
+# --- Fix for Qt Platform Plugin Error on macOS ---
+import PyQt6
+dirname = os.path.dirname(PyQt6.__file__)
+plugin_path = os.path.join(dirname, 'Qt6', 'plugins', 'platforms')
+os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = plugin_path
+# -------------------------------------------------
+
 import rasterio
 import numpy as np
 import geopandas as gpd
@@ -124,6 +132,10 @@ class DetectionThread(QThread):
         self.output_dir = output_dir
         self.conf = conf
         self.iou = iou
+        self.is_interrupted = False
+
+    def stop(self):
+        self.is_interrupted = True
 
     def run(self):
         try:
@@ -138,8 +150,16 @@ class DetectionThread(QThread):
             else:
                 self.log_signal.emit("🐢 未检测到专用加速硬件，使用 CPU 运行...")
 
+            # Load Model
             self.log_signal.emit(f"正在加载模型: {os.path.basename(self.model_path)}...")
-            model = YOLO(self.model_path)
+            # Auto download check
+            model_to_load = self.model_path
+            if not os.path.exists(self.model_path):
+                model_name = os.path.basename(self.model_path)
+                self.log_signal.emit(f"⚠️ 本地未找到 {model_name}，尝试自动下载...")
+                model_to_load = model_name
+            
+            model = YOLO(model_to_load)
             
             if not os.path.exists(self.output_dir):
                 try:
@@ -151,9 +171,12 @@ class DetectionThread(QThread):
             total_files = len(self.image_paths)
             
             for idx, image_path in enumerate(self.image_paths):
+                if self.is_interrupted:
+                    self.log_signal.emit("🛑 任务已终止。")
+                    break
+
                 file_start_time = time.time()
                 base_name = os.path.splitext(os.path.basename(image_path))[0]
-                output_shp_path = os.path.join(self.output_dir, f"{base_name}_result.shp")
                 
                 self.log_signal.emit(f"[{idx+1}/{total_files}] 正在读取影像: {base_name}...")
                 
@@ -163,6 +186,13 @@ class DetectionThread(QThread):
                     
                     img_data = src.read()
                     img_array = np.transpose(img_data, (1, 2, 0))
+                    
+                    # Ensure 3 channels (RGB) for YOLO
+                    if img_array.shape[2] > 3:
+                        img_array = img_array[:, :, :3]
+                    elif img_array.shape[2] == 1:
+                        img_array = np.repeat(img_array, 3, axis=2)
+                        
                     img_array = np.ascontiguousarray(img_array)
                     
                     h, w = img_array.shape[:2]
@@ -176,72 +206,95 @@ class DetectionThread(QThread):
                     # --- 智能切片扫描逻辑 ---
                     if h > 1000 or w > 1000:
                         self.log_signal.emit("🚀 启用高精度切片扫描模式 (Sliding Window)...")
+                        self.log_signal.emit("⚡️ 已启用批量推理 (Batch Inference) 以最大化性能...")
                         slice_size = 640
                         stride = 500
+                        batch_size = 8 # 批量大小，根据显存调整
                         
                         total_slices = ((h // stride) + 1) * ((w // stride) + 1)
                         processed_count = 0
                         
+                        batch_crops = []
+                        batch_coords = [] # (x, y)
+
+                        def process_batch(crops, coords):
+                            if not crops: return
+                            # Run Batch Inference
+                            results = model.predict(crops, save=False, conf=self.conf, iou=self.iou, augment=False, verbose=False, device=device)
+                            
+                            for i, r in enumerate(results):
+                                off_x, off_y = coords[i]
+                                
+                                # Process OBB
+                                if r.obb is not None and len(r.obb) > 0:
+                                    for obb in r.obb:
+                                        points = obb.xyxyxyxy[0].cpu().numpy()
+                                        points[:, 0] += off_x
+                                        points[:, 1] += off_y
+                                        final_polygons.append(points)
+                                        final_scores.append(float(obb.conf.cpu().numpy()[0]))
+                                        cls_id = int(obb.cls.cpu().numpy()[0])
+                                        final_classes.append(cls_id)
+                                        final_names.append(model.names[cls_id])
+                                
+                                # Process HBB
+                                elif r.boxes is not None and len(r.boxes) > 0:
+                                    for box_data in r.boxes:
+                                        bx1, by1, bx2, by2 = box_data.xyxy[0].cpu().numpy()
+                                        points = np.array([
+                                            [bx1+off_x, by1+off_y], [bx2+off_x, by1+off_y], 
+                                            [bx2+off_x, by2+off_y], [bx1+off_x, by2+off_y]
+                                        ])
+                                        final_polygons.append(points)
+                                        final_scores.append(float(box_data.conf.cpu().numpy()[0]))
+                                        cls_id = int(box_data.cls.cpu().numpy()[0])
+                                        final_classes.append(cls_id)
+                                        final_names.append(model.names[cls_id])
+                        
                         for y in range(0, h, stride):
+                            if self.is_interrupted: break
+
                             for x in range(0, w, stride):
+                                if self.is_interrupted: break
+
                                 h_slice = min(slice_size, h - y)
                                 w_slice = min(slice_size, w - x)
                                 crop = img_array[y:y+h_slice, x:x+w_slice]
                                 
-                                # 预测
-                                results = model.predict(crop, save=False, conf=self.conf, iou=self.iou, augment=False, verbose=False, device=device)
+                                batch_crops.append(crop)
+                                batch_coords.append((x, y))
                                 
-                                for r in results:
-                                    # 处理 OBB (旋转框)
-                                    if r.obb is not None and len(r.obb) > 0:
-                                        for i, obb in enumerate(r.obb):
-                                            points = obb.xyxyxyxy[0].cpu().numpy()
-                                            points[:, 0] += x
-                                            points[:, 1] += y
-                                            final_polygons.append(points)
-                                            final_scores.append(float(obb.conf.cpu().numpy()[0]))
-                                            cls_id = int(obb.cls.cpu().numpy()[0])
-                                            final_classes.append(cls_id)
-                                            final_names.append(model.names[cls_id])
+                                if len(batch_crops) >= batch_size:
+                                    process_batch(batch_crops, batch_coords)
+                                    processed_count += len(batch_crops)
+                                    batch_crops = []
+                                    batch_coords = []
                                     
-                                    # 处理 HBB (水平框)
-                                    elif r.boxes is not None and len(r.boxes) > 0:
-                                        for box_data in r.boxes:
-                                            bx1, by1, bx2, by2 = box_data.xyxy[0].cpu().numpy()
-                                            points = np.array([
-                                                [bx1+x, by1+y], [bx2+x, by1+y], 
-                                                [bx2+x, by2+y], [bx1+x, by2+y]
-                                            ])
-                                            final_polygons.append(points)
-                                            final_scores.append(float(box_data.conf.cpu().numpy()[0]))
-                                            cls_id = int(box_data.cls.cpu().numpy()[0])
-                                            final_classes.append(cls_id)
-                                            final_names.append(model.names[cls_id])
-                                
-                                processed_count += 1
-                                
-                                # 更新进度和 ETA
-                                elapsed = time.time() - file_start_time
-                                if processed_count > 0:
-                                    avg_time_per_slice = elapsed / processed_count
-                                    remaining_slices = total_slices - processed_count
-                                    eta_seconds = remaining_slices * avg_time_per_slice
-                                    eta_str = time.strftime("%M:%S", time.gmtime(eta_seconds))
-                                else:
-                                    eta_str = "--:--"
-                                
-                                # 获取系统资源
-                                usage_str = "CPU: ?%"
-                                if HAS_PSUTIL:
-                                    cpu_p = psutil.cpu_percent()
-                                    mem_p = psutil.virtual_memory().percent
-                                    usage_str = f"CPU: {cpu_p}% | MEM: {mem_p}%"
-                                
-                                # 总体进度 = (已完成文件数 + 当前文件进度) / 总文件数
-                                current_file_progress = processed_count / total_slices
-                                total_progress = int(((idx + current_file_progress) / total_files) * 100)
-                                
-                                self.progress_signal.emit(total_progress, f"ETA: {eta_str} (File {idx+1}/{total_files})", usage_str)
+                                    # 更新进度
+                                    elapsed = time.time() - file_start_time
+                                    if processed_count > 0:
+                                        avg_time_per_slice = elapsed / processed_count
+                                        remaining_slices = total_slices - processed_count
+                                        eta_seconds = remaining_slices * avg_time_per_slice
+                                        eta_str = time.strftime("%M:%S", time.gmtime(eta_seconds))
+                                    else:
+                                        eta_str = "--:--"
+                                    
+                                    usage_str = "CPU: ?%"
+                                    if HAS_PSUTIL:
+                                        cpu_p = psutil.cpu_percent()
+                                        mem_p = psutil.virtual_memory().percent
+                                        usage_str = f"CPU: {cpu_p}% | MEM: {mem_p}%"
+                                    
+                                    current_file_progress = processed_count / total_slices
+                                    total_progress = int(((idx + current_file_progress) / total_files) * 100)
+                                    self.progress_signal.emit(total_progress, f"ETA: {eta_str} (File {idx+1}/{total_files})", usage_str)
+                        
+                        # Process remaining
+                        if batch_crops and not self.is_interrupted:
+                            process_batch(batch_crops, batch_coords)
+                            processed_count += len(batch_crops)
+                            self.progress_signal.emit(int(((idx + 1) / total_files) * 100), "Done", "Processing...")
                             
                     else:
                         self.log_signal.emit("影像较小，使用全图模式...")
@@ -268,12 +321,16 @@ class DetectionThread(QThread):
                         
                         self.progress_signal.emit(int(((idx + 1) / total_files) * 100), "Done", "Processing...")
 
+                    if self.is_interrupted:
+                        self.log_signal.emit("🛑 任务已终止。")
+                        break
+
                     # --- 准备数据 ---
                     geometries = []
-                    detections_list = [] 
+                    all_detections_list = []
                     
                     if len(final_polygons) > 0:
-                        self.log_signal.emit(f"[{base_name}] 最终确认 {len(final_polygons)} 个目标...")
+                        self.log_signal.emit(f"确认 {len(final_polygons)} 个目标...")
                         for i, points in enumerate(final_polygons):
                             # points shape: (4, 2)
                             # 1. 生成 Shapefile 几何 (Polygon)
@@ -288,16 +345,17 @@ class DetectionThread(QThread):
                             min_x, min_y = np.min(points, axis=0)
                             max_x, max_y = np.max(points, axis=0)
                             
-                            detections_list.append({
+                            all_detections_list.append({
                                 'name': final_names[i],
                                 'bbox': [float(min_x), float(min_y), float(max_x), float(max_y)], 
                                 'polygon': points.tolist(), 
                                 'score': float(final_scores[i])
                             })
                     else:
-                        self.log_signal.emit(f"[{base_name}] ⚠️ 未检测到任何目标。")
+                        self.log_signal.emit("⚠️ 未检测到任何目标。")
 
                     # 导出 Shapefile
+                    output_shp_path = os.path.join(self.output_dir, f"{base_name}_result.shp")
                     if len(geometries) > 0:
                         gdf = gpd.GeoDataFrame({
                             'Class': final_names,
@@ -307,32 +365,24 @@ class DetectionThread(QThread):
                     else:
                         gdf = gpd.GeoDataFrame({'Class': [], 'Score': []}, geometry=[], crs=crs)
                         gdf.to_file(output_shp_path, driver='ESRI Shapefile', encoding='utf-8')
-
-                    # --- 生成可视化结果 ---
-                    self.log_signal.emit(f"[{base_name}] 正在绘制可视化结果...")
                     
+                    # Stats
                     from collections import Counter
                     count_stats = Counter(final_names)
-                    stats_text = f"【{base_name} 统计】\n"
+                    stats_summary = f"【{base_name} 统计】\n"
                     for cls_name, count in count_stats.items():
-                        stats_text += f"- {cls_name}: {count} 个\n"
+                        stats_summary += f"- {cls_name}: {count} 个\n"
+
+                    # --- 生成可视化结果 (Combined) ---
+                    # For simplicity, we just save the original image as "vis" or maybe draw Model A?
+                    # Actually, the UI redraws everything dynamically now, so this static image is less critical.
+                    # We'll just save a clean copy or maybe draw the first model's result.
                     
                     vis_img = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                    
-                    for i, points in enumerate(final_polygons):
-                        pts = points.astype(np.int32).reshape((-1, 1, 2))
-                        cv2.polylines(vis_img, [pts], True, (0, 0, 255), 2)
-                        
-                        x1, y1 = pts[0][0]
-                        label = f"{final_names[i]}"
-                        (w_text, h_text), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        cv2.rectangle(vis_img, (x1, y1 - 20), (x1 + w_text, y1), (0, 0, 255), -1)
-                        cv2.putText(vis_img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
                     temp_vis_path = os.path.join(self.output_dir, f"{base_name}_vis.png")
                     cv2.imwrite(temp_vis_path, vis_img)
                     
-                    self.result_signal.emit(image_path, temp_vis_path, stats_text, detections_list)
+                    self.result_signal.emit(image_path, temp_vis_path, stats_summary, all_detections_list)
 
             self.finish_signal.emit(f"✅ 批量处理完成！共处理 {total_files} 个文件。")
 
@@ -342,14 +392,12 @@ class DetectionThread(QThread):
             print(error_msg) 
             self.finish_signal.emit(f"❌ 出错: {str(e)}")
 
-# --- GEE 下载对话框 ---
-
 
 # --- 界面部分 ---
 class AI_GIS_App(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI GIS 遥感智能解译系统 (Pro)")
+        self.setWindowTitle("AI GIS 遥感智能解译系统")
         self.setGeometry(100, 100, 1400, 900)
         
         # 持久化设置
@@ -449,7 +497,7 @@ class AI_GIS_App(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(10, 10, 10, 10)
         
-        title_lbl = QLabel("<h2>🛰️ AI 遥感检测 Pro</h2>")
+        title_lbl = QLabel("<h2>AI遥感检测</h2>")
         title_lbl.setStyleSheet("color: #61afef; margin-bottom: 10px;")
         title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_layout.addWidget(title_lbl)
@@ -464,13 +512,17 @@ class AI_GIS_App(QMainWindow):
         # 模型选择
         config_layout.addWidget(QLabel("选择检测模型:"))
         self.combo_model = QComboBox()
+        self.combo_model.addItem("YOLO11n-OBB (最新/遥感) - 旋转框", resource_path(os.path.join("models", "yolo11n-obb.pt")))
+        self.combo_model.addItem("YOLO11x-OBB (最新/遥感) - 高精旋转", resource_path(os.path.join("models", "yolo11x-obb.pt")))
+        self.combo_model.addItem("YOLO11n (最新/通用) - 速度快", resource_path(os.path.join("models", "yolo11n.pt")))
+        self.combo_model.addItem("YOLO11x (最新/通用) - 精度高", resource_path(os.path.join("models", "yolo11x.pt")))
         self.combo_model.addItem("YOLOv8n-OBB (遥感/DOTA) - 旋转框", resource_path(os.path.join("models", "yolov8n-obb.pt")))
         self.combo_model.addItem("YOLOv8x-OBB (遥感/DOTA) - 高精旋转", resource_path(os.path.join("models", "yolov8x-obb.pt")))
         self.combo_model.addItem("YOLOv8n (通用/COCO) - 速度快", resource_path(os.path.join("models", "yolov8n.pt")))
         self.combo_model.addItem("YOLOv8x (通用/COCO) - 精度高", resource_path(os.path.join("models", "yolov8x.pt")))
         self.combo_model.currentIndexChanged.connect(self.on_model_changed)
         config_layout.addWidget(self.combo_model)
-        
+
         self.lbl_model_desc = QLabel("适合航拍视角，支持旋转目标检测 (如船只、车辆)")
         self.lbl_model_desc.setWordWrap(True)
         self.lbl_model_desc.setStyleSheet("font-size: 12px; color: #98c379; margin-bottom: 10px;")
@@ -522,7 +574,7 @@ class AI_GIS_App(QMainWindow):
         self.btn_folder.clicked.connect(self.select_folder)
         btn_layout.addWidget(self.btn_folder)
         
-        self.btn_clear = QPushButton("🗑️")
+        self.btn_clear = QPushButton("🗑️ 清除队列")
         self.btn_clear.setFixedWidth(40)
         self.btn_clear.clicked.connect(self.clear_queue)
         btn_layout.addWidget(self.btn_clear)
@@ -546,11 +598,22 @@ class AI_GIS_App(QMainWindow):
         out_layout.addWidget(self.btn_browse)
         task_layout.addLayout(out_layout)
         
-        self.btn_run = QPushButton("🚀 批量开始智能解译")
+        # Run & Stop Buttons
+        run_layout = QHBoxLayout()
+        
+        self.btn_run = QPushButton("🚀 开始智能解译")
         self.btn_run.clicked.connect(self.start_process)
         self.btn_run.setEnabled(False)
         self.btn_run.setStyleSheet("background-color: #98c379; color: #282c34; font-size: 16px; padding: 12px;")
-        task_layout.addWidget(self.btn_run)
+        run_layout.addWidget(self.btn_run)
+        
+        self.btn_stop = QPushButton("🛑 终止")
+        self.btn_stop.clicked.connect(self.stop_process)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setStyleSheet("background-color: #e06c75; color: #282c34; font-size: 16px; padding: 12px;")
+        run_layout.addWidget(self.btn_stop)
+        
+        task_layout.addLayout(run_layout)
         
         # Progress
         self.progress_bar = QProgressBar()
@@ -659,6 +722,9 @@ class AI_GIS_App(QMainWindow):
         self.add_toolbar_action(toolbar, "🔍 缩小", self.action_zoom_out)
         self.add_toolbar_action(toolbar, "🖼️ 适应窗口", self.action_fit_view)
         self.add_toolbar_action(toolbar, "📷 截图", self.action_screenshot)
+        toolbar.addSeparator()
+        self.add_toolbar_action(toolbar, "⬅️ 上一张", self.prev_image)
+        self.add_toolbar_action(toolbar, "下一张 ➡️", self.next_image)
         toolbar.addSeparator()
         self.add_toolbar_action(toolbar, "✋ 拖拽模式", self.action_pan_mode)
         
@@ -1171,18 +1237,25 @@ class AI_GIS_App(QMainWindow):
             self.btn_clear.setEnabled(True)
 
     def select_image(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "选择影像 (支持多选)", "", "GeoTIFF (*.tif *.tiff)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择影像 (支持多选)", "", "Images (*.tif *.tiff *.png *.jpg *.jpeg);;GeoTIFF (*.tif *.tiff);;All Files (*)")
         if paths:
+            added = False
             for path in paths:
                 if path not in self.img_paths:
                     self.img_paths.append(path)
                     self.file_list.addItem(os.path.basename(path))
+                    added = True
             
             if self.img_paths:
                 # 只有当选择了输出目录时才启用运行
                 if self.line_output.text():
                     self.btn_run.setEnabled(True)
                 self.btn_clear.setEnabled(True)
+                
+                # Auto select first if nothing selected
+                if added and self.file_list.currentRow() == -1:
+                    self.file_list.setCurrentRow(0)
+                    self.on_file_clicked(self.file_list.item(0))
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "选择包含影像的文件夹")
@@ -1204,8 +1277,25 @@ class AI_GIS_App(QMainWindow):
                 if self.line_output.text():
                     self.btn_run.setEnabled(True)
                 self.btn_clear.setEnabled(True)
+                
+                # Auto select first if nothing selected
+                if self.file_list.currentRow() == -1:
+                    self.file_list.setCurrentRow(0)
+                    self.on_file_clicked(self.file_list.item(0))
             else:
                 QMessageBox.information(self, "提示", "该文件夹下未找到支持的影像文件。")
+
+    def prev_image(self):
+        row = self.file_list.currentRow()
+        if row > 0:
+            self.file_list.setCurrentRow(row - 1)
+            self.on_file_clicked(self.file_list.currentItem())
+
+    def next_image(self):
+        row = self.file_list.currentRow()
+        if row < self.file_list.count() - 1:
+            self.file_list.setCurrentRow(row + 1)
+            self.on_file_clicked(self.file_list.currentItem())
 
     def clear_queue(self):
         self.img_paths = []
@@ -1247,6 +1337,21 @@ class AI_GIS_App(QMainWindow):
         self.worker.result_signal.connect(self.show_result)
         self.worker.finish_signal.connect(self.on_finished)
         self.worker.start()
+        
+        self.btn_stop.setEnabled(True)
+
+    def stop_process(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.log_box.append("⚠️ 正在终止任务，请稍候...")
+            self.btn_stop.setEnabled(False)
+
+    def on_finished(self, msg):
+        self.log_box.append(msg)
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.progress_bar.setValue(100)
+        self.lbl_eta.setText("Done")
 
     def update_progress(self, percent, eta, usage):
         self.progress_bar.setValue(percent)
@@ -1337,9 +1442,13 @@ class AI_GIS_App(QMainWindow):
                     if len(img_array.shape) == 2:
                         img_array = np.expand_dims(img_array, axis=2)
 
-                    # 只取前3个波段
-                    if img_array.shape[2] >= 3:
+                    # Ensure 3 channels (RGB) for display
+                    if img_array.shape[2] > 3:
                         img_array = img_array[:, :, :3]
+                    elif img_array.shape[2] == 1:
+                        img_array = np.repeat(img_array, 3, axis=2)
+                    
+                    # 转换为 uint8
                     
                     # 转换为 uint8
                     if img_array.dtype != np.uint8:

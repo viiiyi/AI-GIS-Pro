@@ -83,3 +83,9 @@ models/yolov8x.pt
 models/yolov8x-obb.pt
 
 
+
+# Large files
+AI_GIS_Project_Submission.zip
+models/yolo11x-obb.pt
+models/yolov8x-obb.pt
+models/yolov8x.pt
